@@ -103,6 +103,29 @@ typedef struct {
 	 *	ローカルタイトルを取得する
 	 */
 	const wchar_t *(*GetLocalTitle)(void);
+
+	/**
+	 *	メインウィンドウのクライアント領域の右側を、ドッキングパネル用に
+	 *	width ピクセル分予約する (0 を渡すと予約解除)
+	 */
+	void (*SetRightPanelWidth)(int width);
+
+	/**
+	 *	右側にドッキングするパネルの HWND を登録する。
+	 *	登録された HWND は、メインウィンドウがリサイズされる度に
+	 *	予約領域へ自動的に配置される。
+	 */
+	void (*SetRightPanelHwnd)(HWND hwnd);
+
+	/**
+	 *	端末画面上で現在選択されているテキストを取得する
+	 *	(Edit -> Copy と同じ内容)。
+	 *
+	 *	@param	buf			コピー先バッファ (NULL可)
+	 *	@param	bufCount	buf のサイズ (wchar_t単位)
+	 *	@return	選択されている文字数 (終端NUL含まず)。選択なしは0
+	 */
+	int (*GetSelectedTextW)(wchar_t *buf, int bufCount);
 } TTXImports;
 
 /**

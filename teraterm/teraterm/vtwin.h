@@ -85,6 +85,10 @@ private:
 	BOOL isSizing;		// サイズ変更中(WM_SIZING 〜 WM_EXITSIZEMOVE)はTRUE
 	BOOL isClosing;		// TRUE=ウィンドウクローズ中(WM_DESTROYを受信した)
 
+	// 右側にドッキングされる外部パネル (プラグインが登録する, 0=パネルなし)
+	int RightPanelWidth;
+	HWND RightPanelHwnd;
+
 public:
 	CVTWindow(HINSTANCE hInstance);
 	~CVTWindow();
@@ -100,6 +104,8 @@ public:
 	void Startup();
 	void OpenTEK();
 	void Disconnect(BOOL confirm);
+	void SetRightPanelWidth(int width);
+	void SetRightPanelHwnd(HWND hwnd);
 
 protected:
 	virtual BOOL OnCommand(WPARAM wParam, LPARAM lParam);

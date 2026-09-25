@@ -694,6 +694,8 @@ CVTWindow::CVTWindow(HINSTANCE hInstance)
 	vtwin_work.help_id = 0;
 	isSizing = FALSE;
 	isClosing = FALSE;
+	RightPanelWidth = 0;
+	RightPanelHwnd = NULL;
 
 	// UnicodeDebugParam
 	{
@@ -712,7 +714,7 @@ CVTWindow::CVTWindow(HINSTANCE hInstance)
 
 	if (ts.HideTitle>0) {
 		Style = WS_VSCROLL | WS_HSCROLL |
-		        WS_BORDER | WS_THICKFRAME | WS_POPUP;
+		        WS_BORDER | WS_THICKFRAME | WS_POPUP | WS_CLIPCHILDREN;
 
 		if (ts.EtermLookfeel.BGNoFrame)
 			Style &= ~(WS_BORDER | WS_THICKFRAME);
@@ -721,11 +723,11 @@ CVTWindow::CVTWindow(HINSTANCE hInstance)
 #ifdef WINDOW_MAXMIMUM_ENABLED
 		Style = WS_VSCROLL | WS_HSCROLL |
 		        WS_BORDER | WS_THICKFRAME |
-		        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+		        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN;
 #else
 		Style = WS_VSCROLL | WS_HSCROLL |
 		        WS_BORDER | WS_THICKFRAME |
-		        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+		        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
 #endif
 
 	wc.style = CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW;
@@ -2772,55 +2774,79 @@ void CVTWindow::OnSize(WPARAM nType, int cx, int cy)
 	::GetWindowRect(HVTWin,&R);
 	w = R.right - R.left;
 	h = R.bottom - R.top;
-	if (AdjustSize) {
-		ResizeWindow(vt_src, R.left, R.top, w, h, cx, cy);
-	}
-	else {
-		int CellWidth, CellHeight;
-		DispGetCellSize(vt_src, &CellWidth, &CellHeight);
+	{
+		// 右側にドッキングパネルがある場合、その幅を除いた部分で端末サイズを計算する
+		int availCx = cx - RightPanelWidth;
+		if (availCx < 0) {
+			availCx = 0;
+		}
+		if (AdjustSize) {
+			ResizeWindow(vt_src, R.left, R.top, w, h, availCx, cy);
+		}
+		else {
+			int CellWidth, CellHeight;
+			DispGetCellSize(vt_src, &CellWidth, &CellHeight);
 #if 0
-		if (ts.FontScaling) {
-			int NewCellWidth, NewCellHeight;
-			BOOL FontChanged = FALSE;
+			if (ts.FontScaling) {
+				int NewCellWidth, NewCellHeight;
+				BOOL FontChanged = FALSE;
 
-			NewCellWidth = cx / ts.TerminalWidth;
-			NewCellHeight = cy / ts.TerminalHeight;
+				NewCellWidth = cx / ts.TerminalWidth;
+				NewCellHeight = cy / ts.TerminalHeight;
 
-			if (NewCellWidth - ts.FontDW < 3) {
-				NewCellWidth = ts.FontDW + 3;
-			}
-			if (NewCellWidth != CellWidth) {
-				ts.VTFontSize.x = ts.FontDW - NewCellWidth;
-				CellWidth = NewCellWidth;
-				FontChanged = TRUE;
-			}
+				if (NewCellWidth - ts.FontDW < 3) {
+					NewCellWidth = ts.FontDW + 3;
+				}
+				if (NewCellWidth != CellWidth) {
+					ts.VTFontSize.x = ts.FontDW - NewCellWidth;
+					CellWidth = NewCellWidth;
+					FontChanged = TRUE;
+				}
 
-			if (NewCellHeight - ts.FontDH < 3) {
-				NewCellHeight = ts.FontDH + 3;
-			}
-			if (NewCellHeight != CellHeight) {
-				ts.VTFontSize.y = ts.FontDH - NewCellHeight;
-				CellHeight = NewCellHeight;
-				FontChanged = TRUE;
-			}
+				if (NewCellHeight - ts.FontDH < 3) {
+					NewCellHeight = ts.FontDH + 3;
+				}
+				if (NewCellHeight != CellHeight) {
+					ts.VTFontSize.y = ts.FontDH - NewCellHeight;
+					CellHeight = NewCellHeight;
+					FontChanged = TRUE;
+				}
 
-			w = ts.TerminalWidth;
-			h = ts.TerminalHeight;
+				w = ts.TerminalWidth;
+				h = ts.TerminalHeight;
 
-			if (FontChanged) {
-				DispSetFontSize(vt_src, CellWidth, CellHeight);
-				ChangeFont(vt_src, 0);
+				if (FontChanged) {
+					DispSetFontSize(vt_src, CellWidth, CellHeight);
+					ChangeFont(vt_src, 0);
+				}
 			}
-		}
-		else
+			else
 #endif
-		{
-			w = cx / CellWidth;
-			h = cy / CellHeight;
-		}
+			{
+				w = availCx / CellWidth;
+				h = cy / CellHeight;
+			}
 
-		HideStatusLine();
-		BuffChangeWinSize(w,h);
+			HideStatusLine();
+			BuffChangeWinSize(w,h);
+		}
+	}
+
+	if (RightPanelHwnd != NULL && ::IsWindow(RightPanelHwnd)) {
+		if (RightPanelWidth > 0) {
+			// 端末が実際に描画している幅(ScreenWidth)の直後からパネルを
+			// 配置する(要求幅ちょうどの位置に置くと、セル幅で割り切れない
+			// 端数分の隙間が生じ、誰にも消去されない残像/ゴーストの原因になる)
+			int screenWidth, screenHeight;
+			int panelLeft, panelWidth;
+			DispGetScreenSize(vt_src, &screenWidth, &screenHeight);
+			panelLeft = screenWidth;
+			panelWidth = cx - panelLeft;
+			if (panelWidth < 0) {
+				panelWidth = 0;
+			}
+			::MoveWindow(RightPanelHwnd, panelLeft, 0, panelWidth, cy, TRUE);
+		}
 	}
 
 #ifdef WINDOW_MAXMIMUM_ENABLED
@@ -2829,6 +2855,58 @@ void CVTWindow::OnSize(WPARAM nType, int cx, int cy)
 	}
 #endif
 }
+
+/**
+ *	\u30c9\u30c3\u30ad\u30f3\u30b0\u30d1\u30cd\u30eb\u7528\u306b\u30af\u30e9\u30a4\u30a2\u30f3\u30c8\u9818\u57df\u306e\u53f3\u5074\u3092\u4e88\u7d04\u3059\u308b\n *	\u30d7\u30e9\u30b0\u30a4\u30f3\u304c TTXImports \u7d4c\u7531\u3067\u547c\u3076 (0 \u3067\u4e88\u7d04\u89e3\u9664)
+ */
+void CVTWindow::SetRightPanelWidth(int width)
+{
+	if (width < 0) {
+		width = 0;
+	}
+	if (RightPanelWidth == width) {
+		return;
+	}
+	RightPanelWidth = width;
+	// DispChangeWinSize() が「クライアント幅 == 桁数*セル幅」という前提で
+	// 外枠ウィンドウを勝手にリサイズしてしまわないよう、予約幅を伝えておく。
+	// (トグルだけでなく、以後の通常リサイズでも参照され続ける必要がある)
+	DispRightPanelWidth = RightPanelWidth;
+	if (vt_src == NULL || HVTWin == NULL) {
+		return;
+	}
+	RECT cr;
+	// AdjustSize==TRUE のときに OnSize を呼ぶと、端末の内容(桁数)に合わせて
+	// 外枠のウィンドウ自体をリサイズしてしまう(ResizeWindow())。ここでは
+	// 桁数の変更だけを行いたいので、一時的に無効化する。
+	BOOL savedAdjustSize = AdjustSize;
+	AdjustSize = FALSE;
+	// 端末の再描画とパネルの再配置を1回の再描画にまとめ、ちらつきを防ぐ。
+	// LockWindowUpdate() はウィンドウ全体（画面全体）を巻き込んで
+	// 点滅することがあるため、対象ウィンドウ限定の WM_SETREDRAW を使う。
+	// パネル(子ウィンドウ)は親と独立して再描画されるため、こちらも止める。
+	::SendMessage(HVTWin, WM_SETREDRAW, FALSE, 0);
+	if (RightPanelHwnd != NULL && ::IsWindow(RightPanelHwnd)) {
+		::SendMessage(RightPanelHwnd, WM_SETREDRAW, FALSE, 0);
+	}
+	::GetClientRect(HVTWin, &cr);
+	OnSize(SIZE_RESTORED, cr.right, cr.bottom);
+	if (RightPanelHwnd != NULL && ::IsWindow(RightPanelHwnd)) {
+		::SendMessage(RightPanelHwnd, WM_SETREDRAW, TRUE, 0);
+	}
+	::SendMessage(HVTWin, WM_SETREDRAW, TRUE, 0);
+	::RedrawWindow(HVTWin, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+	AdjustSize = savedAdjustSize;
+}
+
+/**
+ *	\u30c9\u30c3\u30ad\u30f3\u30b0\u30d1\u30cd\u30eb\u306e\u30a6\u30a3\u30f3\u30c9\u30a6\u30cf\u30f3\u30c9\u30eb\u3092\u767b\u9332\u3059\u308b\n *	\u767b\u9332\u3055\u308c\u305f\u30cf\u30f3\u30c9\u30eb\u306f OnSize \u306e\u305f\u3073\u306b\u53f3\u7aef\u306b\u81ea\u52d5\u914d\u7f6e\u3055\u308c\u308b
+ */
+void CVTWindow::SetRightPanelHwnd(HWND hwnd)
+{
+	RightPanelHwnd = hwnd;
+}
+
 
 // リサイズ中の処理として、以下の二つを行う。
 // ・ツールチップで新しい端末サイズを表示する
@@ -2847,7 +2925,7 @@ void CVTWindow::OnSizing(WPARAM fwSide, LPRECT pRect)
 
 	margin_width = wr.right - wr.left - cr.right + cr.left;
 	margin_height = wr.bottom - wr.top - cr.bottom + cr.top;
-	nWidth = (pRect->right) - (pRect->left) - margin_width;
+	nWidth = (pRect->right) - (pRect->left) - margin_width - RightPanelWidth;
 	nHeight = (pRect->bottom) - (pRect->top) - margin_height;
 
 	int CellWidth, CellHeight;
@@ -2872,7 +2950,7 @@ void CVTWindow::OnSizing(WPARAM fwSide, LPRECT pRect)
 
 	UpdateSizeTip(HVTWin, w, h, fwSide, pRect->left, pRect->top);
 
-	fixed_width = w * CellWidth + margin_width;
+	fixed_width = w * CellWidth + margin_width + RightPanelWidth;
 	fixed_height = h * CellHeight + margin_height;
 
 	switch (fwSide) {		   // 幅調整

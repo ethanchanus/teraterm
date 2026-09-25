@@ -110,6 +110,9 @@ static BOOL Active = FALSE;
 static BOOL CompletelyVisible;
 BOOL AdjustSize;
 BOOL DontChangeSize=FALSE;
+// ドッキングパネル用にクライアント領域の右側に予約されている幅(px)
+// DispChangeWinSize() がウィンドウを毎回元の幅に戻さないように考慮するために使う
+int DispRightPanelWidth;
 static int CRTWidth, CRTHeight;
 int CursorX, CursorY;
 /* Virtual screen region */
@@ -2109,6 +2112,13 @@ void DispChangeWinSize(vtdraw_t *vt, int Nx, int Ny)
   GetClientRect(vt->hVTWin,&R);
   dW = vt->ScreenWidth - R.right + R.left;
   dH = vt->ScreenHeight - R.bottom + R.top;
+
+  if (DispRightPanelWidth > 0) {
+	// 右側にパネル用の領域を予約している間は、桁数がセル幅で割り切れない
+	// 端数(最大セル幅-1px)が生じるたびに外枠ウィンドウを伸縮させないよう、
+	// 幅方向の自動調整を止める(その端数はパネルの左側の隙間として許容する)
+	dW = 0;
+  }
 
   if ((dW!=0) || (dH!=0))
   {

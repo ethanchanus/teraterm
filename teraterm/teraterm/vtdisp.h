@@ -162,6 +162,7 @@ void DispGetScreenSize(vtdraw_t *vt, int *width, int *height);
 
 extern int WinWidth, WinHeight;
 extern BOOL AdjustSize, DontChangeSize;
+extern int DispRightPanelWidth;
 extern int CursorX, CursorY;
 extern int WinOrgX, WinOrgY, NewOrgX, NewOrgY;
 extern int NumOfLines, NumOfColumns;

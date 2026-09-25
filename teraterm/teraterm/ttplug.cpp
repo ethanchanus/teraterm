@@ -42,6 +42,8 @@
 #include "history_store.h"
 #include "win32helper.h"
 #include "ttwinman.h"
+#include "vtwin.h"
+#include "buffer.h"
 
 #include "ttplugin.h"
 #include "ttplug.h"
@@ -521,6 +523,59 @@ static void UnloadExtensions()
 }
 
 /**
+ *	プラグインから呼ばれる: 右側にドッキングパネル用の幅を予約する
+ */
+static void SetRightPanelWidth(int width)
+{
+	if (pVTWin != NULL) {
+		pVTWin->SetRightPanelWidth(width);
+	}
+}
+
+/**
+ *	プラグインから呼ばれる: ドッキングパネルの HWND を登録する
+ */
+static void SetRightPanelHwnd(HWND hwnd)
+{
+	if (pVTWin != NULL) {
+		pVTWin->SetRightPanelHwnd(hwnd);
+	}
+}
+
+/**
+ *	プラグインから呼ばれる: 現在選択中のテキストを呼び出し側のバッファにコピーする
+ *	(malloc したバッファを直接渡すと、プラグイン側がCRTの異なる
+ *	 static リンクの場合に free() でクラッシュするので、ここでfreeする)
+ */
+static int GetSelectedTextW(wchar_t *buf, int bufCount)
+{
+	wchar_t *strW;
+	int len;
+
+	if (!BuffIsSelected()) {
+		if (buf != NULL && bufCount > 0) {
+			buf[0] = L'\0';
+		}
+		return 0;
+	}
+
+	strW = BuffCBCopyUnicode(FALSE);
+	if (strW == NULL) {
+		if (buf != NULL && bufCount > 0) {
+			buf[0] = L'\0';
+		}
+		return 0;
+	}
+
+	len = (int)wcslen(strW);
+	if (buf != NULL && bufCount > 0) {
+		wcsncpy_s(buf, bufCount, strW, _TRUNCATE);
+	}
+	free(strW);
+	return len;
+}
+
+/**
  *	プラグインに渡す Tera Term の関数
  *
  *	GetImports() でプラグインに渡す
@@ -529,6 +584,9 @@ static void UnloadExtensions()
 const static TTXImports imports = {
 	SetLocalTitle,
 	GetLocalTitle,
+	SetRightPanelWidth,
+	SetRightPanelHwnd,
+	GetSelectedTextW,
 };
 
 /**
