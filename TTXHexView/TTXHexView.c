@@ -34,7 +34,6 @@
 #define _RICHEDIT_VER 0x0500
 #include <richedit.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -52,9 +51,10 @@
 
 #define HEXVIEW_CLASS_NAME L"TTXHexViewWindow"
 
-/* the companion window's default/minimum width, in pixels - must always
-   fit all 4 grouping buttons (see WM_SIZE) without clipping/overlap */
-#define HEXVIEW_DEFAULT_WIDTH  300
+/* the companion window's absolute minimum width, in pixels - must always
+   fit all 4 grouping buttons (see WM_SIZE) without clipping/overlap; the
+   actual default/live minimum is whichever is larger between this and
+   ComputeRequiredPanelWidth() for the current grouping (see WM_GETMINMAXINFO) */
 #define HEXVIEW_MIN_WIDTH      280
 
 /* how many raw received bytes are retained for redisplay (the oldest
@@ -73,6 +73,27 @@
 #define HEXVIEW_SELBUF_LEN 4096
 #define HEXVIEW_HIGHLIGHT_COLOR RGB(255, 255, 153) /* light yellow, hex column */
 #define HEXVIEW_HIGHLIGHT_ASCII_COLOR RGB(144, 238, 144) /* light green, ascii column */
+
+/* the hex-dump text's font: shared between WM_CREATE's EM_SETCHARFORMAT
+   (which actually renders the text) and ComputeRequiredPanelWidth (which
+   must measure with the SAME font, or its width calculation drifts from
+   what the control actually displays) */
+#define HEXVIEW_CONTENT_FONT_FACE L"Consolas"
+#define HEXVIEW_CONTENT_FONT_TWIPS 180 /* 9pt (twips = 1/20 point) */
+
+/* per-column text colors, one palette per theme, so the offset/hex/ascii
+   columns stay visually distinct and readable whether Windows is set to
+   its light ("day") or dark ("night") app theme (see IsSystemDarkMode).
+   The dark palette mirrors common dark-editor colors (e.g. VS Code's
+   default dark theme) for proven readability against a dark background. */
+#define HEXVIEW_LIGHT_BKGND  RGB(255, 255, 255)
+#define HEXVIEW_LIGHT_OFFSET RGB(120, 120, 120) /* muted gray - de-emphasized */
+#define HEXVIEW_LIGHT_HEX    RGB(0, 0, 0)
+#define HEXVIEW_LIGHT_ASCII  RGB(0, 90, 190)    /* medium blue */
+#define HEXVIEW_DARK_BKGND   RGB(30, 30, 30)
+#define HEXVIEW_DARK_OFFSET  RGB(133, 133, 133)
+#define HEXVIEW_DARK_HEX     RGB(212, 212, 212)
+#define HEXVIEW_DARK_ASCII   RGB(86, 156, 214)  /* light blue */
 
 static HANDLE hInst; /* Instance handle of TTX*.DLL */
 static HMODULE hRichEditDll;
@@ -103,6 +124,7 @@ typedef struct {
 	BOOL visible;
 	int groupSize;   /* 4, 8, 16 or 32 bytes per line */
 	int panelWidth;  /* current window width, in pixels */
+	BOOL darkMode;   /* last-detected Windows app theme (see IsSystemDarkMode) */
 
 	/* main window subclass, used to keep the panel aligned beside it */
 	BOOL subclassed;
@@ -142,6 +164,15 @@ typedef struct {
 	int lineMarkCount;
 	int lineOffset;
 	BOOL lineOffsetKnown;
+
+	/* terminal-scroll -> hex-view-scroll following: a pure delta tracker
+	   (no calibration needed, unlike lineOffset above - a constant offset
+	   between two monotonic counters cancels out of any delta between two
+	   readings of each), so it works from the very first scroll, without
+	   needing a prior text selection first */
+	BOOL topLineKnown;
+	int lastTerminalTopLine;
+	int hexViewTopLocalLine;
 } TInstVar;
 
 typedef TInstVar *PTInstVar;
@@ -276,6 +307,96 @@ static wchar_t *FormatRows(int fromIdx, int toIdx, int perLine)
 	return out;
 }
 
+/*
+ * ---- day/night (light/dark) column colors ----
+ */
+
+/* Windows' own "light vs dark app" setting (Settings > Personalization >
+   Colors); missing key/value (older Windows) is treated as light. */
+static BOOL IsSystemDarkMode(void)
+{
+	HKEY hKey;
+	DWORD value = 1, size = sizeof(value), type = 0;
+
+	if (RegOpenKeyExW(HKEY_CURRENT_USER,
+	                   L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+	                   0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+		return FALSE;
+	}
+	if (RegQueryValueExW(hKey, L"AppsUseLightTheme", NULL, &type, (LPBYTE)&value, &size) != ERROR_SUCCESS ||
+	    type != REG_DWORD) {
+		value = 1;
+	}
+	RegCloseKey(hKey);
+	return value == 0; /* AppsUseLightTheme: 0 = dark, 1 = light */
+}
+
+/* (re)detect the current theme and apply its background + baseline text
+   color; called once at WM_CREATE and again on WM_SETTINGCHANGE so a live
+   Windows theme switch is picked up without restarting Tera Term */
+static void ApplyTheme(void)
+{
+	CHARFORMAT2W cf;
+
+	if (pvar->EditCtrl == NULL) {
+		return;
+	}
+	pvar->darkMode = IsSystemDarkMode();
+
+	SendMessageW(pvar->EditCtrl, EM_SETBKGNDCOLOR, 0,
+	             (LPARAM)(pvar->darkMode ? HEXVIEW_DARK_BKGND : HEXVIEW_LIGHT_BKGND));
+
+	ZeroMemory(&cf, sizeof(cf));
+	cf.cbSize = sizeof(cf);
+	cf.dwMask = CFM_COLOR;
+	cf.crTextColor = pvar->darkMode ? HEXVIEW_DARK_HEX : HEXVIEW_LIGHT_HEX;
+	SendMessageW(pvar->EditCtrl, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
+}
+
+/* Color each row's offset/hex/ascii columns per the current theme. Called
+   after every RenderAll() rebuild, since SetWindowTextW's fresh text always
+   needs its per-column colors re-applied. The hex-bytes column is left at
+   the document's baseline color (set by ApplyTheme) since it's the
+   majority of each row's text - only the offset label and ascii columns
+   are overridden here, one row at a time (RichEdit selections are a single
+   contiguous range, so per-column coloring can't be done in one call). */
+static void ApplyColumnColors(void)
+{
+	CHARFORMAT2W cf;
+	int perLine = pvar->groupSize;
+	int totalRows, row;
+	COLORREF offsetColor = pvar->darkMode ? HEXVIEW_DARK_OFFSET : HEXVIEW_LIGHT_OFFSET;
+	COLORREF asciiColor = pvar->darkMode ? HEXVIEW_DARK_ASCII : HEXVIEW_LIGHT_ASCII;
+
+	if (pvar->EditCtrl == NULL || pvar->byteCount <= 0) {
+		return;
+	}
+
+	ZeroMemory(&cf, sizeof(cf));
+	cf.cbSize = sizeof(cf);
+	cf.dwMask = CFM_COLOR;
+
+	totalRows = (pvar->byteCount + perLine - 1) / perLine;
+	for (row = 0; row < totalRows; row++) {
+		int rowFirstByte = row * perLine;
+		int n = pvar->byteCount - rowFirstByte;
+		int rowStart = RowStartChar(row);
+		int asciiStart = AsciiCharOffset(rowFirstByte, perLine);
+
+		if (n > perLine) {
+			n = perLine;
+		}
+
+		SendMessageW(pvar->EditCtrl, EM_SETSEL, (WPARAM)rowStart, (LPARAM)(rowStart + 8));
+		cf.crTextColor = offsetColor;
+		SendMessageW(pvar->EditCtrl, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+
+		SendMessageW(pvar->EditCtrl, EM_SETSEL, (WPARAM)asciiStart, (LPARAM)(asciiStart + n));
+		cf.crTextColor = asciiColor;
+		SendMessageW(pvar->EditCtrl, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+	}
+}
+
 /* Fully regenerate the hex dump from byteBuf every time it changes.
    (An earlier version tried to patch only the trailing/incomplete row
    in place via EM_SETSEL/EM_REPLACESEL, computing the patch's start
@@ -290,6 +411,8 @@ static wchar_t *FormatRows(int fromIdx, int toIdx, int perLine)
 static void RenderAll(void)
 {
 	wchar_t *text;
+	CHARRANGE cr;
+	BOOL hadSelection;
 
 	if (pvar->EditCtrl == NULL) {
 		return;
@@ -298,12 +421,26 @@ static void RenderAll(void)
 	pvar->highlightActive = FALSE;
 	pvar->lastSelBuf[0] = L'\0';
 
+	/* preserve the user's own text selection (e.g. mid Ctrl+C) across the
+	   rebuild below, instead of always dropping it and jumping to the end -
+	   our own programmatic highlight never leaves a real selection behind
+	   (see ApplyHighlight/ClearHighlight), so any live selection here is
+	   necessarily the user's */
+	SendMessageW(pvar->EditCtrl, EM_EXGETSEL, 0, (LPARAM)&cr);
+	hadSelection = (cr.cpMin != cr.cpMax);
+
 	text = FormatRows(0, pvar->byteCount, pvar->groupSize);
 	SetWindowTextW(pvar->EditCtrl, (text != NULL) ? text : L"");
 	free(text);
 
-	SendMessageW(pvar->EditCtrl, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
-	SendMessageW(pvar->EditCtrl, EM_SCROLLCARET, 0, 0);
+	ApplyColumnColors();
+
+	if (hadSelection && cr.cpMax <= GetWindowTextLengthW(pvar->EditCtrl)) {
+		SendMessageW(pvar->EditCtrl, EM_EXSETSEL, 0, (LPARAM)&cr);
+	} else {
+		SendMessageW(pvar->EditCtrl, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+		SendMessageW(pvar->EditCtrl, EM_SCROLLCARET, 0, 0);
+	}
 }
 
 static void StoreChunk(const BYTE *data, int len)
@@ -420,6 +557,90 @@ static void PASCAL TTXCloseFile(TTXFileHooks *hooks)
  * ---- hex view companion window ----
  */
 
+static void PositionHexViewDefault(HWND mainHWin); /* fwd decl: SetGroupSize re-aligns the panel after resizing it */
+
+#define HEXVIEW_INI_SECTION L"TTXHexView"
+
+/* persist the user's last-selected grouping across restarts (teraterm.ini) */
+static void SaveGroupSize(int size)
+{
+	wchar_t buf[16];
+
+	if (pvar->ts == NULL || pvar->ts->SetupFNameW == NULL) {
+		return;
+	}
+	_itow_s(size, buf, _countof(buf), 10);
+	WritePrivateProfileStringW(HEXVIEW_INI_SECTION, L"GroupSize", buf, pvar->ts->SetupFNameW);
+}
+
+static int LoadGroupSize(void)
+{
+	int size;
+
+	if (pvar->ts == NULL || pvar->ts->SetupFNameW == NULL) {
+		return 8;
+	}
+	size = (int)GetPrivateProfileIntW(HEXVIEW_INI_SECTION, L"GroupSize", 8, pvar->ts->SetupFNameW);
+	if (size != 4 && size != 8 && size != 16 && size != 32) {
+		size = 8; /* corrupt/foreign value - fall back to the default */
+	}
+	return size;
+}
+
+/* the window width (screen pixels) needed so a full `perLine`-byte row
+   (offset label + hex bytes + ascii) is entirely visible with no
+   horizontal clipping/scrolling, for the same font/style as the edit
+   control (see WM_CREATE) - computed from scratch so it works even
+   before the hex-view window/font exist yet (e.g. at plugin init) */
+/* the window width (screen pixels) needed so a full `perLine`-byte row
+   (offset label + hex bytes + ascii) is entirely visible with no
+   horizontal clipping/scrolling - measured using the EXACT font the edit
+   control's TEXT is actually rendered with (HEXVIEW_CONTENT_FONT_*, applied
+   via EM_SETCHARFORMAT in WM_CREATE; note this is unrelated to pvar->hFont,
+   which is only ever applied to the toolbar buttons) - computed from
+   scratch so it works even before the hex-view window/font exist yet
+   (e.g. at plugin init) */
+static int ComputeRequiredPanelWidth(int perLine)
+{
+	HFONT font, oldFont;
+	HDC dc;
+	SIZE sz;
+	int visibleChars = 10 + perLine * 3 + 1 + perLine; /* offset label + hex bytes + separator + ascii */
+	int pointSize = HEXVIEW_CONTENT_FONT_TWIPS / 20;
+	wchar_t sample[210];
+	RECT r;
+	DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN;
+	DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_COMPOSITED;
+	int clientWidth, width;
+
+	visibleChars += 2; /* small safety margin against GDI-vs-richedit metric rounding */
+	if (visibleChars >= _countof(sample)) {
+		visibleChars = _countof(sample) - 1;
+	}
+	wmemset(sample, L'0', (size_t)visibleChars);
+	sample[visibleChars] = L'\0';
+
+	dc = CreateCompatibleDC(NULL);
+	font = CreateFontW(-MulDiv(pointSize, GetDeviceCaps(dc, LOGPIXELSY), 72), 0, 0, 0, FW_NORMAL,
+	                    FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+	                    DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, HEXVIEW_CONTENT_FONT_FACE);
+	oldFont = (HFONT)SelectObject(dc, font);
+	GetTextExtentPoint32W(dc, sample, visibleChars, &sz);
+	SelectObject(dc, oldFont);
+	DeleteDC(dc);
+	DeleteObject(font);
+
+	/* the richedit control's own client-edge border + vertical scrollbar,
+	   on top of the row text itself */
+	clientWidth = sz.cx + GetSystemMetrics(SM_CXEDGE) * 2 + GetSystemMetrics(SM_CXVSCROLL);
+
+	SetRect(&r, 0, 0, clientWidth, 100);
+	AdjustWindowRectEx(&r, style, FALSE, exStyle);
+	width = r.right - r.left;
+
+	return (width < HEXVIEW_MIN_WIDTH) ? HEXVIEW_MIN_WIDTH : width;
+}
+
 static void UpdateGroupButtons(void)
 {
 	if (pvar->Btn4 == NULL) {
@@ -437,8 +658,13 @@ static void SetGroupSize(int newSize)
 		return;
 	}
 	pvar->groupSize = newSize;
+	pvar->panelWidth = ComputeRequiredPanelWidth(newSize);
+	SaveGroupSize(newSize);
 	UpdateGroupButtons();
 	RenderAll();
+	if (pvar->HexWin != NULL && pvar->visible && pvar->cv != NULL) {
+		PositionHexViewDefault(pvar->cv->HWin);
+	}
 }
 
 /*
@@ -465,23 +691,68 @@ static int LocalLineAtByte(int idx)
 	return result;
 }
 
-/* Append one entry to a persistent log recording the terminal's selected
-   text and the resulting hex-view highlight area, so the correlation
-   between the two (otherwise invisible) is easy to verify. */
-static void AppendDebugLog(const wchar_t *msg)
+/* the reverse of LocalLineAtByte: the byte index where local line `line`
+   starts, i.e. the earliest recorded mark whose local line is >= line.
+   If `line` is beyond every recorded mark (at/after the latest retained
+   byte), returns byteCount (the live/bottom edge); if it is before every
+   recorded mark (scrolled into history this instance already evicted -
+   see StoreChunk), returns the earliest still-retained mark's byte index. */
+static int ByteAtLocalLine(int line)
 {
-	wchar_t path[MAX_PATH];
-	FILE *f;
+	int lo = 0, hi = pvar->lineMarkCount - 1;
+	int result = pvar->byteCount;
 
-	if (GetTempPathW(_countof(path), path) == 0) {
+	while (lo <= hi) {
+		int mid = (lo + hi) / 2;
+
+		if (pvar->lineMarkLocalLine[mid] >= line) {
+			result = pvar->lineMarkByteIdx[mid];
+			hi = mid - 1;
+		} else {
+			lo = mid + 1;
+		}
+	}
+	return result;
+}
+
+/* Poll the terminal's current top-of-viewport line and, whenever it
+   changes, scroll the hex view by the same number of lines in the same
+   direction - a pure delta (see hexViewTopLocalLine's comment), so no
+   calibration/anchor is needed and it works from the very first scroll. */
+static void CheckScrollSync(void)
+{
+	int topLine, delta, targetByteIdx, targetRow, rowStartChar, lineIdx, currentTopLineIdx;
+
+	if (pvar->imports == NULL || pvar->EditCtrl == NULL || !pvar->visible) {
 		return;
 	}
-	wcscat_s(path, _countof(path), L"ttxhexview_debug.log");
-	if (_wfopen_s(&f, path, L"a, ccs=UTF-8") != 0 || f == NULL) {
+	topLine = pvar->imports->GetTopLine();
+
+	if (!pvar->topLineKnown) {
+		pvar->lastTerminalTopLine = topLine;
+		pvar->hexViewTopLocalLine = pvar->localLine; /* assume "currently at the bottom" */
+		pvar->topLineKnown = TRUE;
 		return;
 	}
-	fwprintf(f, L"%ls", msg);
-	fclose(f);
+	if (topLine == pvar->lastTerminalTopLine) {
+		return; /* terminal hasn't scrolled since the last poll */
+	}
+	delta = topLine - pvar->lastTerminalTopLine;
+	pvar->lastTerminalTopLine = topLine;
+
+	pvar->hexViewTopLocalLine += delta;
+	if (pvar->hexViewTopLocalLine < 0) {
+		pvar->hexViewTopLocalLine = 0;
+	} else if (pvar->hexViewTopLocalLine > pvar->localLine) {
+		pvar->hexViewTopLocalLine = pvar->localLine;
+	}
+
+	targetByteIdx = ByteAtLocalLine(pvar->hexViewTopLocalLine);
+	targetRow = targetByteIdx / pvar->groupSize;
+	rowStartChar = RowStartChar(targetRow);
+	lineIdx = (int)SendMessageW(pvar->EditCtrl, EM_LINEFROMCHAR, (WPARAM)rowStartChar, 0);
+	currentTopLineIdx = (int)SendMessageW(pvar->EditCtrl, EM_GETFIRSTVISIBLELINE, 0, 0);
+	SendMessageW(pvar->EditCtrl, EM_LINESCROLL, 0, lineIdx - currentTopLineIdx);
 }
 
 static void ClearHighlight(void)
@@ -532,17 +803,11 @@ static void ApplyHighlight(int startChar, int endChar, COLORREF color)
  * line (GetSelectionStartLine) is used - via a locally tracked byte-index
  * <-> line map - to pick the occurrence that is actually selected, rather
  * than always the first (earliest-received) one.
- *
- * Every selection change is recorded via AppendDebugLog() (terminal
- * selected text + the resulting hex-view highlight area), to
- * %TEMP%\ttxhexview_debug.log.
  */
 static void CheckSelectionHighlight(void)
 {
 	wchar_t selBuf[HEXVIEW_SELBUF_LEN];
 	char utf8[HEXVIEW_SELBUF_LEN];
-	wchar_t logBuf[2048];
-	int logPos = 0;
 	int selLen, utf8Len, j;
 	int matches[HEXVIEW_MAX_MATCHES];
 	int matchCount = 0;
@@ -559,9 +824,6 @@ static void CheckSelectionHighlight(void)
 		if (pvar->highlightActive) {
 			ClearHighlight();
 			pvar->highlightActive = FALSE;
-		}
-		if (pvar->lastSelBuf[0] != L'\0') {
-			AppendDebugLog(L"selection cleared\r\n");
 		}
 		pvar->lastSelBuf[0] = L'\0';
 		return;
@@ -586,10 +848,6 @@ static void CheckSelectionHighlight(void)
 	}
 
 	terminalLine = pvar->imports->GetSelectionStartLine();
-
-	logPos += swprintf_s(logBuf + logPos, _countof(logBuf) - logPos,
-	                      L"selected=\"%ls\" terminalLine=%d matches=%d",
-	                      selBuf, terminalLine, matchCount);
 
 	if (matchCount > 0) {
 		matchIdx = matches[0]; /* fallback: earliest occurrence */
@@ -619,11 +877,6 @@ static void CheckSelectionHighlight(void)
 			}
 		}
 
-		logPos += swprintf_s(logBuf + logPos, _countof(logBuf) - logPos,
-		                      L" chosenByteIdx=%d chosenLocalLine=%d lineOffset=%d(%ls)\r\n",
-		                      matchIdx, LocalLineAtByte(matchIdx), pvar->lineOffset,
-		                      pvar->lineOffsetKnown ? L"known" : L"unknown");
-
 		{
 			int lastByte = matchIdx + utf8Len - 1;
 			int perLine = pvar->groupSize;
@@ -644,19 +897,11 @@ static void CheckSelectionHighlight(void)
 
 				ApplyHighlight(hexStart, hexEnd, HEXVIEW_HIGHLIGHT_COLOR);
 				ApplyHighlight(asciiStart, asciiEnd, HEXVIEW_HIGHLIGHT_ASCII_COLOR);
-
-				logPos += swprintf_s(logBuf + logPos, _countof(logBuf) - logPos,
-				                      L"  row=%d hex[%d,%d) ascii[%d,%d)\r\n",
-				                      row, hexStart, hexEnd, asciiStart, asciiEnd);
 			}
 			pvar->highlightActive = TRUE;
 			found = TRUE;
 		}
-	} else {
-		logPos += swprintf_s(logBuf + logPos, _countof(logBuf) - logPos, L"\r\n");
 	}
-	(void)logPos;
-	AppendDebugLog(logBuf);
 
 	if (!found && pvar->highlightActive) {
 		ClearHighlight();
@@ -701,8 +946,8 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 			ZeroMemory(&cf, sizeof(cf));
 			cf.cbSize = sizeof(cf);
 			cf.dwMask = CFM_FACE | CFM_SIZE;
-			cf.yHeight = 180; /* 9pt, in twips */
-			wcscpy_s(cf.szFaceName, _countof(cf.szFaceName), L"Consolas");
+			cf.yHeight = HEXVIEW_CONTENT_FONT_TWIPS;
+			wcscpy_s(cf.szFaceName, _countof(cf.szFaceName), HEXVIEW_CONTENT_FONT_FACE);
 			SendMessageW(pvar->EditCtrl, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
 
 			SendMessageW(pvar->Btn4, WM_SETFONT, (WPARAM)pvar->hFont, TRUE);
@@ -710,6 +955,7 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 			SendMessageW(pvar->Btn16, WM_SETFONT, (WPARAM)pvar->hFont, TRUE);
 			SendMessageW(pvar->Btn32, WM_SETFONT, (WPARAM)pvar->hFont, TRUE);
 
+			ApplyTheme();
 			UpdateGroupButtons();
 			RenderAll();
 			return 0;
@@ -742,9 +988,17 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 		}
 		case WM_GETMINMAXINFO: {
 			MINMAXINFO *mmi = (MINMAXINFO *)lParam;
-			mmi->ptMinTrackSize.x = HEXVIEW_MIN_WIDTH;
+			mmi->ptMinTrackSize.x = ComputeRequiredPanelWidth(pvar->groupSize);
 			return 0;
 		}
+		case WM_SETTINGCHANGE:
+			/* Windows broadcasts this for ANY setting change; "ImmersiveColorSet"
+			   is the well-known marker for a light/dark app theme switch */
+			if (lParam != 0 && wcscmp((const wchar_t *)lParam, L"ImmersiveColorSet") == 0) {
+				ApplyTheme();
+				RenderAll();
+			}
+			return 0;
 		case WM_COMMAND:
 			switch (LOWORD(wParam)) {
 				case ID_BTN_GROUP4:
@@ -808,6 +1062,7 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 		case WM_TIMER:
 			if (wParam == HEXVIEW_TIMER_SELECTION) {
 				CheckSelectionHighlight();
+				CheckScrollSync();
 			}
 			return 0;
 		case WM_CLOSE:
@@ -925,6 +1180,7 @@ static void ToggleHexView(HWND mainHWin)
 		PositionHexViewDefault(mainHWin);
 		ShowWindow(pvar->HexWin, SW_SHOW);
 		pvar->visible = TRUE;
+		pvar->topLineKnown = FALSE; /* re-baseline scroll-sync from the current position */
 		SetTimer(pvar->HexWin, HEXVIEW_TIMER_SELECTION, HEXVIEW_TIMER_INTERVAL_MS, NULL);
 	}
 
@@ -1002,10 +1258,11 @@ static BOOL PASCAL TTXInit2(PTTSet ts, PComVar cv, const TTXImports *(*GetImport
 	pvar->Btn4 = pvar->Btn8 = pvar->Btn16 = pvar->Btn32 = NULL;
 	pvar->hFont = NULL;
 	pvar->visible = FALSE;
-	pvar->groupSize = 8;
+	pvar->groupSize = LoadGroupSize();
+	pvar->darkMode = FALSE; /* re-detected by ApplyTheme() once the window exists */
 	pvar->highlightActive = FALSE;
 	pvar->lastSelBuf[0] = L'\0';
-	pvar->panelWidth = HEXVIEW_DEFAULT_WIDTH;
+	pvar->panelWidth = ComputeRequiredPanelWidth(pvar->groupSize);
 	pvar->subclassed = FALSE;
 	pvar->origMainWndProc = NULL;
 	pvar->syncing = FALSE;
@@ -1016,6 +1273,9 @@ static BOOL PASCAL TTXInit2(PTTSet ts, PComVar cv, const TTXImports *(*GetImport
 	pvar->lineMarkCount = 0;
 	pvar->lineOffset = 0;
 	pvar->lineOffsetKnown = FALSE;
+	pvar->topLineKnown = FALSE;
+	pvar->lastTerminalTopLine = 0;
+	pvar->hexViewTopLocalLine = 0;
 
 	return TRUE;
 }

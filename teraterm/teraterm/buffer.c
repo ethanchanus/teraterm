@@ -6152,3 +6152,15 @@ int BuffGetSelectStartLine(void)
 {
 	return SelectStart.y;
 }
+
+/**
+ *	現在画面の一番上に表示されている行番号を取得する
+ *	(絶対行番号、単調増加)。
+ *
+ *	@retval	一番上に表示されている行番号
+ */
+int BuffGetTopLine(void)
+{
+	return PageStart + WinOrgY;
+}
+

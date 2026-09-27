@@ -588,6 +588,15 @@ static int GetSelectionStartLine(void)
 }
 
 /**
+ *	プラグインから呼ばれる: 現在画面の一番上に表示されている行番号を返す
+ *	(絶対行番号、単調増加)。
+ */
+static int GetTopLine(void)
+{
+	return BuffGetTopLine();
+}
+
+/**
  *	プラグインに渡す Tera Term の関数
  *
  *	GetImports() でプラグインに渡す
@@ -600,6 +609,7 @@ const static TTXImports imports = {
 	SetRightPanelHwnd,
 	GetSelectedTextW,
 	GetSelectionStartLine,
+	GetTopLine,
 };
 
 /**

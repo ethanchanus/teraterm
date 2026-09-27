@@ -134,6 +134,14 @@ typedef struct {
 	 *	@return	開始行番号。選択なしの場合は -1
 	 */
 	int (*GetSelectionStartLine)(void);
+
+	/**
+	 *	現在画面の一番上に表示されている行番号を取得する
+	 *	(絶対行番号、単調増加)。
+	 *
+	 *	@return	一番上に表示されている行番号
+	 */
+	int (*GetTopLine)(void);
 } TTXImports;
 
 /**
