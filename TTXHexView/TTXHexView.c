@@ -46,14 +46,16 @@
 /* child control ids, local to the hex view window only */
 #define ID_BTN_GROUP4    61101
 #define ID_BTN_GROUP8    61102
+#define ID_BTN_GROUP16   61104
 #define ID_BTN_GROUP32   61103
 #define ID_EDIT_HEXVIEW  61110
 
 #define HEXVIEW_CLASS_NAME L"TTXHexViewWindow"
 
-/* the companion window's default/minimum width, in pixels */
-#define HEXVIEW_DEFAULT_WIDTH  260
-#define HEXVIEW_MIN_WIDTH      140
+/* the companion window's default/minimum width, in pixels - must always
+   fit all 4 grouping buttons (see WM_SIZE) without clipping/overlap */
+#define HEXVIEW_DEFAULT_WIDTH  300
+#define HEXVIEW_MIN_WIDTH      280
 
 /* how many raw received bytes are retained for redisplay (the oldest
    half is evicted and the view fully rebuilt once this is exceeded) */
@@ -70,7 +72,7 @@
 #define HEXVIEW_TIMER_INTERVAL_MS 300
 #define HEXVIEW_SELBUF_LEN 4096
 #define HEXVIEW_HIGHLIGHT_COLOR RGB(255, 255, 153) /* light yellow, hex column */
-#define HEXVIEW_HIGHLIGHT_ASCII_COLOR RGB(173, 216, 230) /* light blue, ascii column */
+#define HEXVIEW_HIGHLIGHT_ASCII_COLOR RGB(144, 238, 144) /* light green, ascii column */
 
 static HANDLE hInst; /* Instance handle of TTX*.DLL */
 static HMODULE hRichEditDll;
@@ -95,10 +97,11 @@ typedef struct {
 	HWND EditCtrl;
 	HWND Btn4;
 	HWND Btn8;
+	HWND Btn16;
 	HWND Btn32;
 	HFONT hFont;
 	BOOL visible;
-	int groupSize;   /* 4, 8 or 32 bytes per line */
+	int groupSize;   /* 4, 8, 16 or 32 bytes per line */
 	int panelWidth;  /* current window width, in pixels */
 
 	/* main window subclass, used to keep the panel aligned beside it */
@@ -424,6 +427,7 @@ static void UpdateGroupButtons(void)
 	}
 	EnableWindow(pvar->Btn4, pvar->groupSize != 4);
 	EnableWindow(pvar->Btn8, pvar->groupSize != 8);
+	EnableWindow(pvar->Btn16, pvar->groupSize != 16);
 	EnableWindow(pvar->Btn32, pvar->groupSize != 32);
 }
 
@@ -676,6 +680,9 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 			pvar->Btn8 = CreateWindowExW(0, L"BUTTON", L"8 bytes",
 			                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
 			                             0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)ID_BTN_GROUP8, hInst, NULL);
+			pvar->Btn16 = CreateWindowExW(0, L"BUTTON", L"16 bytes",
+			                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+			                              0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)ID_BTN_GROUP16, hInst, NULL);
 			pvar->Btn32 = CreateWindowExW(0, L"BUTTON", L"32 bytes",
 			                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
 			                              0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)ID_BTN_GROUP32, hInst, NULL);
@@ -700,6 +707,7 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 
 			SendMessageW(pvar->Btn4, WM_SETFONT, (WPARAM)pvar->hFont, TRUE);
 			SendMessageW(pvar->Btn8, WM_SETFONT, (WPARAM)pvar->hFont, TRUE);
+			SendMessageW(pvar->Btn16, WM_SETFONT, (WPARAM)pvar->hFont, TRUE);
 			SendMessageW(pvar->Btn32, WM_SETFONT, (WPARAM)pvar->hFont, TRUE);
 
 			UpdateGroupButtons();
@@ -709,8 +717,8 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 		case WM_SIZE: {
 			int cw = LOWORD(lParam);
 			int ch = HIWORD(lParam);
-			int bw = 72, bh = 24, pad = 4;
-			HDWP dwp = BeginDeferWindowPos(4); /* batch the moves into one repaint pass */
+			int bw = 64, bh = 24, pad = 4;
+			HDWP dwp = BeginDeferWindowPos(5); /* batch the moves into one repaint pass */
 
 			if (dwp != NULL) {
 				dwp = DeferWindowPos(dwp, pvar->Btn4, NULL, pad, pad, bw, bh, SWP_NOZORDER);
@@ -719,7 +727,10 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 				dwp = DeferWindowPos(dwp, pvar->Btn8, NULL, pad * 2 + bw, pad, bw, bh, SWP_NOZORDER);
 			}
 			if (dwp != NULL) {
-				dwp = DeferWindowPos(dwp, pvar->Btn32, NULL, pad * 3 + bw * 2, pad, bw, bh, SWP_NOZORDER);
+				dwp = DeferWindowPos(dwp, pvar->Btn16, NULL, pad * 3 + bw * 2, pad, bw, bh, SWP_NOZORDER);
+			}
+			if (dwp != NULL) {
+				dwp = DeferWindowPos(dwp, pvar->Btn32, NULL, pad * 4 + bw * 3, pad, bw, bh, SWP_NOZORDER);
 			}
 			if (dwp != NULL) {
 				dwp = DeferWindowPos(dwp, pvar->EditCtrl, NULL, 0, bh + pad * 2, cw, ch - (bh + pad * 2), SWP_NOZORDER);
@@ -741,6 +752,9 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 					break;
 				case ID_BTN_GROUP8:
 					SetGroupSize(8);
+					break;
+				case ID_BTN_GROUP16:
+					SetGroupSize(16);
 					break;
 				case ID_BTN_GROUP32:
 					SetGroupSize(32);
@@ -812,7 +826,7 @@ static LRESULT CALLBACK HexViewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 			}
 			pvar->HexWin = NULL;
 			pvar->EditCtrl = NULL;
-			pvar->Btn4 = pvar->Btn8 = pvar->Btn32 = NULL;
+			pvar->Btn4 = pvar->Btn8 = pvar->Btn16 = pvar->Btn32 = NULL;
 			return 0;
 	}
 	return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -985,7 +999,7 @@ static BOOL PASCAL TTXInit2(PTTSet ts, PComVar cv, const TTXImports *(*GetImport
 	pvar->FileMenu = NULL;
 	pvar->HexWin = NULL;
 	pvar->EditCtrl = NULL;
-	pvar->Btn4 = pvar->Btn8 = pvar->Btn32 = NULL;
+	pvar->Btn4 = pvar->Btn8 = pvar->Btn16 = pvar->Btn32 = NULL;
 	pvar->hFont = NULL;
 	pvar->visible = FALSE;
 	pvar->groupSize = 8;
