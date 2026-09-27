@@ -6141,3 +6141,14 @@ BOOL BuffIsSelected(void)
 {
 	return Selected;
 }
+
+/**
+ *	選択領域の開始行番号を取得する (絶対行番号、単調増加)
+ *
+ *	@retval	選択領域の開始行番号。選択されていない場合は不定
+ *			(呼び出し前に BuffIsSelected() で確認すること)
+ */
+int BuffGetSelectStartLine(void)
+{
+	return SelectStart.y;
+}

@@ -59,11 +59,18 @@
    half is evicted and the view fully rebuilt once this is exceeded) */
 #define HEXVIEW_MAX_BYTES 65536
 
+/* how many byte-index <-> terminal-line "marks" (one per line break) are
+   retained, and how many occurrences of a repeated selected text are
+   considered when disambiguating which one the terminal selection means */
+#define HEXVIEW_MAX_LINE_MARKS 4096
+#define HEXVIEW_MAX_MATCHES 64
+
 /* selection-highlight polling */
 #define HEXVIEW_TIMER_SELECTION 1
 #define HEXVIEW_TIMER_INTERVAL_MS 300
 #define HEXVIEW_SELBUF_LEN 4096
-#define HEXVIEW_HIGHLIGHT_COLOR RGB(255, 255, 153) /* light yellow */
+#define HEXVIEW_HIGHLIGHT_COLOR RGB(255, 255, 153) /* light yellow, hex column */
+#define HEXVIEW_HIGHLIGHT_ASCII_COLOR RGB(173, 216, 230) /* light blue, ascii column */
 
 static HANDLE hInst; /* Instance handle of TTX*.DLL */
 static HMODULE hRichEditDll;
@@ -117,6 +124,21 @@ typedef struct {
 	   normal hex editor instead of starting a new row per system call */
 	int byteCount;
 	BYTE byteBuf[HEXVIEW_MAX_BYTES];
+
+	/* approximate byte-index -> terminal absolute-line-number mapping, used
+	   to tell which occurrence of a repeated selected text corresponds to
+	   the terminal's actual selection when the same text appears more than
+	   once. localLine counts LF bytes seen so far (Tera Term's own line
+	   counter also advances once per line feed); lineMark* records the byte
+	   index where each line starts, alongside localLine's value there.
+	   lineOffset (once calibrated against an unambiguous match) converts a
+	   localLine value to Tera Term's own absolute SelectStart.y numbering. */
+	int localLine;
+	int lineMarkByteIdx[HEXVIEW_MAX_LINE_MARKS];
+	int lineMarkLocalLine[HEXVIEW_MAX_LINE_MARKS];
+	int lineMarkCount;
+	int lineOffset;
+	BOOL lineOffsetKnown;
 } TInstVar;
 
 typedef TInstVar *PTInstVar;
@@ -162,21 +184,43 @@ static HMENU GetSubMenuByChildID(HMENU menu, UINT id)
  */
 
 /* character width of one *complete* (fully-filled) row, for a given group
-   size: "%08X  " + perLine*"XX " + " " + perLine ascii chars + "\r\n" */
+   size: "%08X  " + perLine*"XX " + " " + perLine ascii chars + "\r\n" -
+   used only to size/format our own off-control wchar_t buffer; NOT valid
+   for computing EM_SETSEL positions against the live control (see
+   RowStartChar) */
 static int RowCharWidth(int perLine)
 {
 	return 10 + perLine * 3 + 1 + perLine + 2;
 }
 
-/* character offset, within its row, of byte `idx`'s hex token - a pure
-   formula, since only the last row can ever be incomplete and every row
-   before it is always fully-filled */
+/* character index, in the live control's own text, of the start of row
+   `row`. Once text has been handed to a RichEdit control via
+   SetWindowTextW, the control collapses each "\r\n" line ending we wrote
+   into a single internal paragraph-break character, so a plain
+   `row * RowCharWidth(perLine)` formula undercounts by one character per
+   row already crossed (row 1 short by 1, row 2 short by 2, ...). Asking
+   the control directly via EM_LINEINDEX sidesteps that entirely. */
+static int RowStartChar(int row)
+{
+	return (int)SendMessageW(pvar->EditCtrl, EM_LINEINDEX, (WPARAM)row, 0);
+}
+
+/* character offset, within the live control's text, of byte `idx`'s hex
+   token */
 static int HexCharOffset(int idx, int perLine)
 {
-	int row = idx / perLine;
 	int col = idx % perLine;
 
-	return row * RowCharWidth(perLine) + 10 + col * 3;
+	return RowStartChar(idx / perLine) + 10 + col * 3;
+}
+
+/* character offset, within the live control's text, of byte `idx`'s
+   ascii char */
+static int AsciiCharOffset(int idx, int perLine)
+{
+	int col = idx % perLine;
+
+	return RowStartChar(idx / perLine) + 10 + perLine * 3 + 1 + col;
 }
 
 /* format byteBuf[fromIdx .. toIdx) as hex-dump rows */
@@ -278,15 +322,38 @@ static void StoreChunk(const BYTE *data, int len)
 			continue;
 		}
 		if (pvar->byteCount >= HEXVIEW_MAX_BYTES) {
-			/* evict the oldest half to make room for new bytes */
+			/* evict the oldest half to make room for new bytes, and rebase
+			   (or drop) the line marks the same way */
 			int keep = HEXVIEW_MAX_BYTES / 2;
 			int drop = pvar->byteCount - keep;
+			int w = 0, r;
 
 			memmove(pvar->byteBuf, pvar->byteBuf + drop, (size_t)keep);
 			pvar->byteCount = keep;
+
+			for (r = 0; r < pvar->lineMarkCount; r++) {
+				if (pvar->lineMarkByteIdx[r] >= drop) {
+					pvar->lineMarkByteIdx[w] = pvar->lineMarkByteIdx[r] - drop;
+					pvar->lineMarkLocalLine[w] = pvar->lineMarkLocalLine[r];
+					w++;
+				}
+			}
+			pvar->lineMarkCount = w;
 		}
 		pvar->byteBuf[pvar->byteCount++] = b;
 		added = TRUE;
+
+		if (b == '\n') {
+			/* a new line begins right after this byte - record it, so a
+			   later selection-highlight lookup can tell which line any
+			   given byte belongs to (see LocalLineAtByte()) */
+			pvar->localLine++;
+			if (pvar->lineMarkCount < HEXVIEW_MAX_LINE_MARKS) {
+				pvar->lineMarkByteIdx[pvar->lineMarkCount] = pvar->byteCount;
+				pvar->lineMarkLocalLine[pvar->lineMarkCount] = pvar->localLine;
+				pvar->lineMarkCount++;
+			}
+		}
 	}
 
 	if (!added) {
@@ -374,6 +441,45 @@ static void SetGroupSize(int newSize)
  * ---- terminal-selection -> hex byte highlighting ----
  */
 
+/* the local line number (see StoreChunk's LF tracking) active at byte
+   index idx: the highest recorded lineMarkLocalLine whose byte index is
+   <= idx, or 0 if idx is on the very first line */
+static int LocalLineAtByte(int idx)
+{
+	int lo = 0, hi = pvar->lineMarkCount - 1, result = 0;
+
+	while (lo <= hi) {
+		int mid = (lo + hi) / 2;
+
+		if (pvar->lineMarkByteIdx[mid] <= idx) {
+			result = pvar->lineMarkLocalLine[mid];
+			lo = mid + 1;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	return result;
+}
+
+/* Append one entry to a persistent log recording the terminal's selected
+   text and the resulting hex-view highlight area, so the correlation
+   between the two (otherwise invisible) is easy to verify. */
+static void AppendDebugLog(const wchar_t *msg)
+{
+	wchar_t path[MAX_PATH];
+	FILE *f;
+
+	if (GetTempPathW(_countof(path), path) == 0) {
+		return;
+	}
+	wcscat_s(path, _countof(path), L"ttxhexview_debug.log");
+	if (_wfopen_s(&f, path, L"a, ccs=UTF-8") != 0 || f == NULL) {
+		return;
+	}
+	fwprintf(f, L"%ls", msg);
+	fclose(f);
+}
+
 static void ClearHighlight(void)
 {
 	CHARFORMAT2W cf;
@@ -392,7 +498,7 @@ static void ClearHighlight(void)
 	SendMessageW(pvar->EditCtrl, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
 }
 
-static void ApplyHighlight(int startChar, int endChar)
+static void ApplyHighlight(int startChar, int endChar, COLORREF color)
 {
 	CHARFORMAT2W cf;
 
@@ -403,7 +509,7 @@ static void ApplyHighlight(int startChar, int endChar)
 	ZeroMemory(&cf, sizeof(cf));
 	cf.cbSize = sizeof(cf);
 	cf.dwMask = CFM_BACKCOLOR;
-	cf.crBackColor = HEXVIEW_HIGHLIGHT_COLOR;
+	cf.crBackColor = color;
 	SendMessageW(pvar->EditCtrl, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
 
 	/* scroll so the highlighted range is visible, then drop the native
@@ -418,12 +524,26 @@ static void ApplyHighlight(int startChar, int endChar)
  * in the hex view. Best-effort: the terminal only reports the selected
  * TEXT (already decoded/rendered), not raw byte offsets, so the text is
  * re-encoded as UTF-8 and searched for within the retained received bytes.
+ * If that text appears more than once, the terminal's reported selection
+ * line (GetSelectionStartLine) is used - via a locally tracked byte-index
+ * <-> line map - to pick the occurrence that is actually selected, rather
+ * than always the first (earliest-received) one.
+ *
+ * Every selection change is recorded via AppendDebugLog() (terminal
+ * selected text + the resulting hex-view highlight area), to
+ * %TEMP%\ttxhexview_debug.log.
  */
 static void CheckSelectionHighlight(void)
 {
 	wchar_t selBuf[HEXVIEW_SELBUF_LEN];
 	char utf8[HEXVIEW_SELBUF_LEN];
+	wchar_t logBuf[2048];
+	int logPos = 0;
 	int selLen, utf8Len, j;
+	int matches[HEXVIEW_MAX_MATCHES];
+	int matchCount = 0;
+	int terminalLine;
+	int matchIdx;
 	BOOL found = FALSE;
 
 	if (pvar->imports == NULL || pvar->EditCtrl == NULL || !pvar->visible) {
@@ -435,6 +555,9 @@ static void CheckSelectionHighlight(void)
 		if (pvar->highlightActive) {
 			ClearHighlight();
 			pvar->highlightActive = FALSE;
+		}
+		if (pvar->lastSelBuf[0] != L'\0') {
+			AppendDebugLog(L"selection cleared\r\n");
 		}
 		pvar->lastSelBuf[0] = L'\0';
 		return;
@@ -450,18 +573,86 @@ static void CheckSelectionHighlight(void)
 		return;
 	}
 
-	for (j = 0; j + utf8Len <= pvar->byteCount && !found; j++) {
+	for (j = 0; j + utf8Len <= pvar->byteCount; j++) {
 		if (memcmp(pvar->byteBuf + j, utf8, (size_t)utf8Len) == 0) {
-			int lastByte = j + utf8Len - 1;
-			int startChar = HexCharOffset(j, pvar->groupSize);
-			int endChar = HexCharOffset(lastByte, pvar->groupSize) + 2; /* the last byte's 2 hex digits */
+			if (matchCount < HEXVIEW_MAX_MATCHES) {
+				matches[matchCount++] = j;
+			}
+		}
+	}
+
+	terminalLine = pvar->imports->GetSelectionStartLine();
+
+	logPos += swprintf_s(logBuf + logPos, _countof(logBuf) - logPos,
+	                      L"selected=\"%ls\" terminalLine=%d matches=%d",
+	                      selBuf, terminalLine, matchCount);
+
+	if (matchCount > 0) {
+		matchIdx = matches[0]; /* fallback: earliest occurrence */
+
+		if (matchCount == 1) {
+			/* unambiguous: (re)calibrate how the locally-tracked line count
+			   (LF count) relates to the terminal's own line numbering */
+			if (terminalLine >= 0) {
+				pvar->lineOffset = terminalLine - LocalLineAtByte(matches[0]);
+				pvar->lineOffsetKnown = TRUE;
+			}
+		} else if (pvar->lineOffsetKnown && terminalLine >= 0) {
+			/* ambiguous: pick whichever occurrence's line, once converted
+			   with the calibrated offset, is closest to the terminal's
+			   actual selection line */
+			int expectedLocalLine = terminalLine - pvar->lineOffset;
+			int bestDiff = abs(LocalLineAtByte(matches[0]) - expectedLocalLine);
+			int k;
+
+			for (k = 1; k < matchCount; k++) {
+				int diff = abs(LocalLineAtByte(matches[k]) - expectedLocalLine);
+
+				if (diff < bestDiff) {
+					bestDiff = diff;
+					matchIdx = matches[k];
+				}
+			}
+		}
+
+		logPos += swprintf_s(logBuf + logPos, _countof(logBuf) - logPos,
+		                      L" chosenByteIdx=%d chosenLocalLine=%d lineOffset=%d(%ls)\r\n",
+		                      matchIdx, LocalLineAtByte(matchIdx), pvar->lineOffset,
+		                      pvar->lineOffsetKnown ? L"known" : L"unknown");
+
+		{
+			int lastByte = matchIdx + utf8Len - 1;
+			int perLine = pvar->groupSize;
+			int row = matchIdx / perLine;
+			int lastRow = lastByte / perLine;
 
 			ClearHighlight();
-			ApplyHighlight(startChar, endChar);
+			/* highlight one row at a time: a match spanning multiple rows
+			   must not select across the newline/offset-label in between,
+			   or the two colors (and the offset label) bleed into each other */
+			for (; row <= lastRow; row++) {
+				int rowFirst = (row * perLine > matchIdx) ? row * perLine : matchIdx;
+				int rowLast = (row * perLine + perLine - 1 < lastByte) ? row * perLine + perLine - 1 : lastByte;
+				int hexStart = HexCharOffset(rowFirst, perLine);
+				int hexEnd = HexCharOffset(rowLast, perLine) + 2; /* the last byte's 2 hex digits */
+				int asciiStart = AsciiCharOffset(rowFirst, perLine);
+				int asciiEnd = AsciiCharOffset(rowLast, perLine) + 1; /* the last byte's 1 ascii char */
+
+				ApplyHighlight(hexStart, hexEnd, HEXVIEW_HIGHLIGHT_COLOR);
+				ApplyHighlight(asciiStart, asciiEnd, HEXVIEW_HIGHLIGHT_ASCII_COLOR);
+
+				logPos += swprintf_s(logBuf + logPos, _countof(logBuf) - logPos,
+				                      L"  row=%d hex[%d,%d) ascii[%d,%d)\r\n",
+				                      row, hexStart, hexEnd, asciiStart, asciiEnd);
+			}
 			pvar->highlightActive = TRUE;
 			found = TRUE;
 		}
+	} else {
+		logPos += swprintf_s(logBuf + logPos, _countof(logBuf) - logPos, L"\r\n");
 	}
+	(void)logPos;
+	AppendDebugLog(logBuf);
 
 	if (!found && pvar->highlightActive) {
 		ClearHighlight();
@@ -807,6 +998,10 @@ static BOOL PASCAL TTXInit2(PTTSet ts, PComVar cv, const TTXImports *(*GetImport
 	pvar->lastLeft = 0;
 	pvar->lastTop = 0;
 	pvar->byteCount = 0;
+	pvar->localLine = 0;
+	pvar->lineMarkCount = 0;
+	pvar->lineOffset = 0;
+	pvar->lineOffsetKnown = FALSE;
 
 	return TRUE;
 }

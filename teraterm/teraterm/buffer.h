@@ -156,6 +156,7 @@ void BuffStartSelect(int Xw, int Yw, BOOL Box, BOOL shift);
 void BuffChangeSelect(int Xw, int Yw, int NClick);
 void BuffEndSelect(int Xw, int Yw);
 BOOL BuffIsSelected(void);
+int BuffGetSelectStartLine(void);
 int BuffUrlDblClk(int Xw, int Yw);
 void BuffDblClk(int Xw, int Yw);
 void BuffTplClk(int Yw);

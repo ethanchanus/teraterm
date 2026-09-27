@@ -126,6 +126,14 @@ typedef struct {
 	 *	@return	選択されている文字数 (終端NUL含まず)。選択なしは0
 	 */
 	int (*GetSelectedTextW)(wchar_t *buf, int bufCount);
+
+	/**
+	 *	現在選択されている範囲の開始行番号を取得する
+	 *	(絶対行番号、単調増加)。
+	 *
+	 *	@return	開始行番号。選択なしの場合は -1
+	 */
+	int (*GetSelectionStartLine)(void);
 } TTXImports;
 
 /**

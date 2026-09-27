@@ -576,6 +576,18 @@ static int GetSelectedTextW(wchar_t *buf, int bufCount)
 }
 
 /**
+ *	プラグインから呼ばれる: 現在選択されている範囲の開始行番号を返す
+ *	(絶対行番号、単調増加)。選択されていない場合は -1
+ */
+static int GetSelectionStartLine(void)
+{
+	if (!BuffIsSelected()) {
+		return -1;
+	}
+	return BuffGetSelectStartLine();
+}
+
+/**
  *	プラグインに渡す Tera Term の関数
  *
  *	GetImports() でプラグインに渡す
@@ -587,6 +599,7 @@ const static TTXImports imports = {
 	SetRightPanelWidth,
 	SetRightPanelHwnd,
 	GetSelectedTextW,
+	GetSelectionStartLine,
 };
 
 /**
